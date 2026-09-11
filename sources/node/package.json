@@ -1,0 +1,6 @@
+{
+  "name": "railkit-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": { "railkit": "^5.0.3" }
+}
