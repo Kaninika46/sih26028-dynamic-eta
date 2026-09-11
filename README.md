@@ -94,7 +94,7 @@ Fused 80% range contains the true arrival 79.5% of the time.
 Network and weather features are offered too; they are kept only if validation improves
 (network did not; weather is offered once `pipeline.add_weather` has run).
 
-## Honest findings (tell the judges before they ask)
+## Honest findings
 
 - **XGBoost v2 covers all 40 trains.** The first model (kept in `XGBOOST/` and
   `models/xgb_branch_v1_teammate.py` for reference) only knew 27.
