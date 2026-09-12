@@ -1,0 +1,5 @@
+.env
+data/cache/
+sources/node/node_modules/
+__pycache__/
+*.sqlite
