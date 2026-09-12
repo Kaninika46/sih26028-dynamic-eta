@@ -1,6 +1,5 @@
-﻿venv/
-.venv/
-**/__pycache__/
-*.py[cod]
-
 .env
+data/cache/
+sources/node/node_modules/
+__pycache__/
+*.sqlite

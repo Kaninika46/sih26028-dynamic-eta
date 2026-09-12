@@ -8,6 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root{
   --bg:#080D12; --surface:#0E161D; --surface-2:#141F28; --surface-3:#1B2A35;
@@ -754,14 +755,25 @@ function viewLogin(role){
          <div class="field"><label>PNR <span style="color:var(--text-3);font-weight:400">(optional)</span></label><input type="text" placeholder="4821093456"></div>`,
       b:'Continue', n:''},
   }[role];
+  if(AUTH.on){
+    // Staff screens are sign-in only: real Supabase credentials replace the demo fields.
+    cfg.f=`<div class="field"><label>${role==='pax'?'Email':'Official email'}</label><input id="loginEmail" type="email" autocomplete="username" placeholder="name@example.com"></div>
+      <div class="field"><label>Password</label><input id="loginPw" type="password" autocomplete="current-password" placeholder="••••••••" onkeydown="if(event.key==='Enter')signIn('${role}')"></div>`;
+    if(role==='stn') cfg.f+=`<div class="field"><label>Station</label><input id="stnPick" type="text" value="${esc(AUTH.user&&AUTH.user.station_code?AUTH.user.station_code:'Assigned on sign in')}" readonly></div>`;
+    if(role!=='pax') cfg.n='Accounts are issued by the administrator. Sign-ins and overrides are recorded in the audit log.';
+  }else if(role!=='pax'){
+    cfg.n='DEMO MODE — no database is connected, so this screen is not protected. Add the Supabase keys in .env to require a sign in.';
+  }
   return `<div class="login-wrap"><div class="login ${role}">
     <button class="back" onclick="go('landing')">← back</button>
     <div class="top-bar"></div>
     <div class="ic">${svg(cfg.ic)}</div>
     <h2>${cfg.h}</h2><p class="sub">${cfg.s}</p>
     ${cfg.f}
-    ${role==='pax'?'<div class="otp" id="otp">✓ OTP auto-verified for demo</div>':''}
-    <button class="btn" onclick="enter('${role}')">${cfg.b}</button>
+    ${role==='pax'&&!AUTH.on?'<div class="otp" id="otp">✓ OTP auto-verified for demo</div>':''}
+    <div id="loginErr" style="display:none;color:var(--red);font-size:12.5px;margin:6px 0"></div>
+    <button class="btn" onclick="signIn('${role}')">${(!AUTH.on&&role!=='pax')?'Continue without sign in (demo)':cfg.b}</button>
+    ${role==='pax'&&AUTH.on?`<button class="alt" onclick="signUp()">Create a passenger account</button>`:''}
     ${cfg.n?`<p class="note">${cfg.n}</p>`:''}
     ${role==='pax'?`<button class="alt" onclick="enter('pax')">Continue as guest →</button>`:''}
   </div></div>`;
@@ -775,13 +787,14 @@ function chrome(inner, tabs=true){
     <div class="brand"><div class="logo-mark"><div class="core"></div></div>
       <div><div class="bt">RUNTIME</div><div class="bs">Live Arrival Intelligence</div></div></div>
     ${tabs?`<div class="tabs">${[['control','Control Room'],['station','Station Display'],['passenger','Passenger'],['analytics','Analytics']]
-      .map(([k,l])=>`<button class="tab ${S.tab===k?'on':''}" onclick="setTab('${k}')">${l}</button>`).join('')}</div>`:'<div></div>'}
+      .filter(([k])=>allowedViews().includes(k)).map(([k,l])=>`<button class="tab ${S.tab===k?'on':''}" onclick="setTab('${k}')">${l}</button>`).join('')}</div>`:'<div></div>'}
     <div class="right">
       <div class="clock"><div class="t" id="clk">${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}</div>
         <div class="z">IST${S.live?' · live data':''}</div></div>
       <button class="icon-btn" onclick="toggleTheme()" title="${isLight()?'Switch to dark':'Switch to light'} theme"
         aria-label="Toggle theme">${svg(isLight()?I.moon:I.sun)}</button>
-      <button class="icon-btn" onclick="go('landing')" title="Log out">${svg(I.out)}</button>
+      ${AUTH.user?`<span class="z" style="font-size:11px;color:var(--text-3)">${esc(AUTH.user.email||'')} · ${esc(AUTH.user.role)}</span>`:''}
+      <button class="icon-btn" onclick="signOut()" title="Log out">${svg(I.out)}</button>
     </div></div>
     ${tabs?ticker():''}
     ${inner}`;
@@ -898,10 +911,17 @@ function auditHTML(){
     <div><b>${esc(a.train)}</b> #${esc(a.id)} — ${esc(a.type)}</div>
     <div style="color:var(--text-3);font-size:11.5px">at ${esc(a.loc)}</div></div>`).join('');
 }
-function injectOverride(){
+async function injectOverride(){
   const t=sel(); if(!t) return;
+  if(!canDo('override')){ toast('Only control room staff can inject overrides'); return; }
   const role=$('ovRole').value, type=$('ovType').value, loc=$('ovLoc').value,
         sev=$('ovSev').value, note=$('ovNote').value||'No additional notes provided.';
+  if(S.live){
+    const r=await api('/api/override',{method:'POST', body:{train_no:t.id, type, location:loc, severity:sev, note}});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); toast(e.error||('Override refused ('+r.status+')')); return; }
+    toast(`Override saved for ${t.name} - ETA recomputed`);
+    await loadLive(); if(canDo('audit')) await loadAudit(); render(); return;
+  }
   const bump = sev.includes('Critical')?45 : sev.includes('High')?30 : sev.includes('Moderate')?18 : 8;
   const n=new Date(), time=pad(n.getHours())+':'+pad(n.getMinutes());
   t.override={by:`${role} · session ${Math.floor(Math.random()*9000+1000)}`,type,loc,sev,time,note};
@@ -1187,13 +1207,20 @@ function viewAnalytics(){
 }
 
 /* ================= ROUTER ================= */
-function go(screen, role){ document.body.classList.remove('shell'); S.screen=screen; S.role=role||S.role; render(); }
+function go(screen, role){
+  if(screen==='login' && AUTH.on && AUTH.user && PORTAL[role] && PORTAL[role].includes(AUTH.user.role)){ S.role=role; enter(role); return; }
+  document.body.classList.remove('shell'); S.screen=screen; S.role=role||S.role; render(); }
 function enter(role){
-  if(role==='stn'){ const p=$('stnPick'); if(p&&!/Auto-detect/.test(p.value)) S.stationName=p.value.split(' — ')[1]||S.stationName; }
+  if(AUTH.on && role!=='pax' && !AUTH.user){ go('login', role); return; }
+  if(role==='stn'){
+    if(AUTH.on && AUTH.user && AUTH.user.station_code){ S.stationCode=AUTH.user.station_code; S.stationName=AUTH.user.station_code; }
+    else { const p=$('stnPick'); if(p&&!/Auto-detect|Assigned/.test(p.value)) S.stationName=p.value.split(' — ')[1]||S.stationName; }
+  }
   S.screen='app'; S.tab = role==='ctrl'?'control':role==='stn'?'station':'passenger';
+  if(!allowedViews().includes(S.tab)) S.tab=allowedViews()[0];
   render();
 }
-function setTab(t){ S.tab=t; render(); }
+function setTab(t){ if(!allowedViews().includes(t)){ toast('Your account cannot open this screen'); return; } S.tab=t; render(); }
 function pick(id){ S.selId=id; render(); }
 function pickPax(id){ S.paxId=id; render(); }
 function setCtrlQuery(v){ S.ctrlQuery=v; renderPanel('ctrlS'); }
@@ -1207,6 +1234,7 @@ function render(){
   const root=app();
   if(S.screen==='landing'){ root.innerHTML=viewLanding(); return; }
   if(S.screen==='login'){ root.innerHTML=viewLogin(S.role); return; }
+  if(!allowedViews().includes(S.tab)) S.tab=allowedViews()[0];   // never render a forbidden screen
 
   document.body.classList.toggle('light', isLight());
   document.body.classList.toggle('shell', S.tab==='control');
@@ -1233,6 +1261,77 @@ function render(){
 setInterval(()=>{ const c=$('clk'); if(c){ const n=new Date();
   c.textContent=`${pad(n.getHours())}:${pad(n.getMinutes())}:${pad(n.getSeconds())}`; } },1000);
 
+/* ================= AUTH (Supabase) ================= */
+const AUTH = {on:false, sb:null, token:null, user:null};
+const PORTAL = {ctrl:['controller','admin'], stn:['station','controller','admin'],
+                pax:['passenger','station','controller','admin']};
+function allowedViews(){ if(!AUTH.on) return ['control','station','passenger','analytics'];
+  return AUTH.user ? AUTH.user.views : ['passenger']; }
+function canDo(a){ return !AUTH.on || !!(AUTH.user && AUTH.user.actions.includes(a)); }
+async function api(path, opts={}){
+  const h={...(opts.headers||{})};
+  if(AUTH.token) h['Authorization']='Bearer '+AUTH.token;
+  if(opts.body && typeof opts.body!=='string'){ h['Content-Type']='application/json'; opts={...opts, body:JSON.stringify(opts.body)}; }
+  return fetch(path,{...opts, headers:h});
+}
+async function initAuth(){
+  try{
+    const r=await fetch('/api/config'); if(!r.ok) return;
+    const c=await r.json();
+    if(!c.auth) return;
+    if(!window.supabase){ console.log('Supabase library did not load - sign-in unavailable'); AUTH.on=true; return; }
+    AUTH.on=true; AUTH.sb=window.supabase.createClient(c.supabaseUrl, c.supabaseKey);
+    AUTH.sb.auth.onAuthStateChange((_e, session)=>{ AUTH.token = session ? session.access_token : null; });
+    const {data}=await AUTH.sb.auth.getSession();
+    if(data.session){ AUTH.token=data.session.access_token; await loadMe(); }
+  }catch(e){ console.log('Auth config not available: '+e.message); }
+}
+async function loadMe(){
+  const r=await api('/api/me'); AUTH.user = r.ok ? await r.json() : null; return AUTH.user;
+}
+function loginErr(msg){ const el=$('loginErr'); if(el){ el.textContent=msg; el.style.display='block'; } }
+async function signIn(portal){
+  if(!AUTH.on){ enter(portal); return; }
+  if(!AUTH.sb){ loginErr('Sign-in service could not load - check your connection.'); return; }
+  const email=($('loginEmail')||{}).value, pw=($('loginPw')||{}).value;
+  if(!email||!pw){ loginErr('Enter your email and password.'); return; }
+  const {data,error}=await AUTH.sb.auth.signInWithPassword({email, password:pw});
+  if(error){ loginErr(error.message); return; }
+  AUTH.token=data.session.access_token;
+  const me=await loadMe();
+  if(!me){ loginErr('Could not load your profile.'); return; }
+  if(!PORTAL[portal].includes(me.role)){
+    await AUTH.sb.auth.signOut(); AUTH.token=null; AUTH.user=null;
+    loginErr(`This is a ${me.role} account - it cannot open this screen.`); return;
+  }
+  api('/api/log',{method:'POST', body:{action: portal==='stn'?'station_board_opened':'control_room_signin',
+    detail:{station: me.station_code||null, email: me.email||null}}});
+  enter(portal); await loadLive(); if(canDo('audit')) loadAudit();
+}
+async function signUp(){
+  if(!AUTH.sb){ loginErr('Sign-in service could not load.'); return; }
+  const email=($('loginEmail')||{}).value, pw=($('loginPw')||{}).value;
+  if(!email||!pw||pw.length<6){ loginErr('Enter an email and a password of at least 6 characters.'); return; }
+  const {data,error}=await AUTH.sb.auth.signUp({email, password:pw});
+  if(error){ loginErr(error.message); return; }
+  if(!data.session){ loginErr('Account created. Confirm the link in your email, then sign in.'); return; }
+  AUTH.token=data.session.access_token; await loadMe(); enter('pax'); loadLive();
+}
+async function signOut(){
+  if(AUTH.sb) await AUTH.sb.auth.signOut();
+  AUTH.token=null; AUTH.user=null; S.audit=[]; go('landing');
+}
+async function loadAudit(){
+  const r=await api('/api/audit'); if(!r.ok) return;
+  const rows=await r.json();
+  S.audit=rows.filter(a=>a.action==='override').map(a=>{
+    const d=a.detail||{}, t=new Date(a.created_at), tr=S.trains.find(x=>x.id===String(a.train_no));
+    return {train:tr?tr.name:('Train '+a.train_no), id:String(a.train_no), type:d.incident_type||a.action,
+            loc:d.location||'', time:pad(t.getHours())+':'+pad(t.getMinutes()), by:a.role};
+  });
+  if(S.tab==='control') render();
+}
+
 /* ================= LIVE DATA ================= */
 async function loadLive(){
   try{
@@ -1241,7 +1340,7 @@ async function loadLive(){
       console.log(`Loaded ${Object.keys(d).length} station coordinates.`); } }
   }catch(e){}
   try{
-    const r=await fetch('/api/trains');
+    const r=await api('/api/trains');
     if(!r.ok){ console.log('Backend returned '+r.status+' — using demo data.'); return; }
     const d=await r.json();
     if(Array.isArray(d)&&d.length){
@@ -1254,7 +1353,9 @@ async function loadLive(){
           progress: (typeof t.progress==='number') ? t.progress : .3+Math.random()*.3};
       }).filter(t=>t.stations.length>=2);
       if(S.trains.length){
-        S.selId=S.trains[0].id; S.paxId=S.trains[0].id; S.live=true;
+        if(!S.trains.some(t=>t.id===S.selId)) S.selId=S.trains[0].id;
+        if(!S.trains.some(t=>t.id===S.paxId)) S.paxId=S.trains[0].id;
+        S.live=true;
         S.stationName = S.trains[0].from || S.stationName;
         console.log(`Loaded ${S.trains.length} trains from backend (real model predictions).`);
         render();
@@ -1264,8 +1365,9 @@ async function loadLive(){
 }
 
 render();
-if(document.readyState==='complete') loadLive();
-else window.addEventListener('load', loadLive);
+async function boot(){ await initAuth(); await loadLive(); if(AUTH.user && canDo('audit')) loadAudit(); render(); }
+if(document.readyState==='complete') boot(); else window.addEventListener('load', boot);
+setInterval(()=>{ if(S.screen==='app') loadLive(); }, 60000);
 </script>
 </body>
 </html>
