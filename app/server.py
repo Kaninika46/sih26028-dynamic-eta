@@ -22,6 +22,7 @@ Run:  python app/server.py      then open http://localhost:8000
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -32,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from config import DATA, OUT
+from sources import supa
 from models.common import KEY, load_data, split
 
 UI = Path(__file__).resolve().parent / "ui" / "index.html"
@@ -175,6 +177,57 @@ class Engine:
 
 ENGINE = None
 
+# ------------------------------------------------------------------ access control
+# Which screens (tabs) and actions each role may use. Enforced here on the server for every
+# privileged request, and a second time by row-level security inside Supabase.
+PERMS = {
+    "guest":      {"views": ["passenger"], "actions": []},
+    "passenger":  {"views": ["passenger"], "actions": []},
+    "station":    {"views": ["station", "passenger"], "actions": ["log"]},
+    "controller": {"views": ["control", "station", "passenger", "analytics"],
+                   "actions": ["override", "cascade", "audit", "log"]},
+    "admin":      {"views": ["control", "station", "passenger", "analytics"],
+                   "actions": ["override", "cascade", "audit", "log"]},
+}
+PORTAL_ROLES = {"ctrl": {"controller", "admin"}, "stn": {"station", "controller", "admin"},
+                "pax": {"passenger", "station", "controller", "admin"}}
+SEVERITY_BUMP = [("Critical", 45), ("High", 30), ("Moderate", 18), ("Low", 8)]
+_ov_cache = {"t": 0, "rows": []}
+
+
+def active_overrides():
+    """Active overrides from the last 6 h (server reads with the secret key; cached 15 s)."""
+    if not supa.enabled() or not supa.SECRET:
+        return []
+    if time.time() - _ov_cache["t"] > 15:
+        since = (pd.Timestamp.utcnow() - pd.Timedelta(hours=6)).isoformat()
+        try:
+            _ov_cache["rows"] = supa.select("overrides", {"active": "eq.true", "created_at": f"gte.{since}",
+                                                          "order": "created_at.desc"})
+        except supa.AuthError:
+            _ov_cache["rows"] = []
+        _ov_cache["t"] = time.time()
+    return _ov_cache["rows"]
+
+
+def apply_overrides(trains, role):
+    by_train = {}
+    for o in active_overrides():
+        by_train.setdefault(str(o["train_no"]), []).append(o)
+    for t in trains:
+        for o in by_train.get(t["id"], [])[:1]:                      # newest override wins
+            b = float(o["bump_min"])
+            t["predMin"] = round(t["predMin"] + b, 1)
+            t["confLo"] = round(t["confLo"] + b * 0.7, 1)
+            t["confHi"] = round(t["confHi"] + b * 1.3, 1)
+            t["breakdown"] = [[f"{o['incident_type']} (override)", b]] + t["breakdown"]
+            t["status"] = "amber" if "Low" in o["severity"] else "red"
+            t["override"] = {"type": o["incident_type"], "loc": o.get("location") or "",
+                             "sev": o["severity"], "note": o.get("note") or "",
+                             "time": pd.Timestamp(o["created_at"]).tz_convert("Asia/Kolkata").strftime("%H:%M"),
+                             "by": "Control room" if role in ("guest", "passenger") else "Controller"}
+    return trains
+
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, body, ctype="application/json", code=200):
@@ -182,8 +235,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        return self._send(json.dumps(obj, default=str), code=code)
+
+    def _user(self):
+        """Signed-in user from the Authorization header, or a guest."""
+        h = self.headers.get("Authorization", "")
+        token = h[7:] if h.startswith("Bearer ") else ""
+        if not supa.enabled():                                   # demo mode: no database configured
+            return {"role": "controller", "demo": True}, ""
+        if not token:
+            return {"role": "guest"}, ""
+        return supa.verify(token), token
+
+    def _require(self, action):
+        user, token = self._user()
+        if action not in PERMS[user["role"]]["actions"]:
+            raise supa.AuthError(f"your role ({user['role']}) is not allowed to {action}", 403)
+        return user, token
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -191,17 +268,68 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path in ("/", "/index.html"):
                 return self._send(UI.read_bytes(), "text/html; charset=utf-8")
-            if u.path == "/api/coords":
-                return self._send(json.dumps(ENGINE.coords))
-            if u.path == "/api/trains":
-                return self._send(json.dumps(ENGINE.trains(q.get("t"))))
-            if u.path == "/api/cascade":
-                return self._send(json.dumps(ENGINE.cascade(q["train"], q["station"], q.get("delay", 30))))
+            if u.path == "/api/config":                           # public: what the browser needs
+                return self._json({"auth": supa.enabled(), "supabaseUrl": supa.URL,
+                                   "supabaseKey": supa.PUBLISHABLE, "perms": PERMS})
             if u.path == "/api/health":
-                return self._send(json.dumps({"ok": True, "replay_day": str(ENGINE.day)}))
-            return self._send(json.dumps({"error": "not found"}), code=404)
+                return self._json({"ok": True, "replay_day": str(ENGINE.day), "auth": supa.enabled()})
+            if u.path == "/api/coords":
+                return self._json(ENGINE.coords)
+            if u.path == "/api/me":
+                user, _ = self._user()
+                if user["role"] == "guest":
+                    raise supa.AuthError("not signed in")
+                return self._json({**user, **PERMS[user["role"]]})
+            if u.path == "/api/trains":
+                user, _ = self._user()
+                return self._json(apply_overrides(ENGINE.trains(q.get("t")), user["role"]))
+            if u.path == "/api/cascade":
+                self._require("cascade")
+                return self._json(ENGINE.cascade(q["train"], q["station"], q.get("delay", 30)))
+            if u.path == "/api/audit":
+                user, token = self._require("audit")
+                if user.get("demo"):
+                    return self._json([])
+                return self._json(supa.select("audit_log", {"select": "created_at,role,action,train_no,detail",
+                                                            "order": "created_at.desc", "limit": "50"}, token=token))
+            return self._json({"error": "not found"}, 404)
+        except supa.AuthError as e:
+            return self._json({"error": str(e)}, e.status)
         except Exception as e:
-            return self._send(json.dumps({"error": str(e)}), code=500)
+            return self._json({"error": str(e)}, 500)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        try:
+            if u.path == "/api/override":
+                user, token = self._require("override")
+                b = self._body()
+                sev = str(b.get("severity", "Moderate"))
+                bump = next((v for k, v in SEVERITY_BUMP if k in sev), 18)
+                row = {"train_no": int(b["train_no"]), "incident_type": str(b.get("type", "Incident"))[:80],
+                       "location": str(b.get("location", ""))[:80], "severity": sev[:40],
+                       "note": str(b.get("note", ""))[:500], "bump_min": bump}
+                if not user.get("demo"):
+                    saved = supa.insert("overrides", [row], token=token)       # RLS checks the role again
+                    supa.insert("audit_log", [{"role": user["role"], "action": "override",
+                                               "train_no": row["train_no"], "detail": row}], token=token)
+                    _ov_cache["t"] = 0
+                    return self._json({"ok": True, "override": saved[0]})
+                return self._json({"ok": True, "override": row, "demo": True})
+            if u.path == "/api/log":                                          # staff sign-ins, board opened
+                user, token = self._require("log")
+                b = self._body()
+                if not user.get("demo"):
+                    supa.insert("audit_log", [{"role": user["role"], "action": str(b.get("action", "event"))[:60],
+                                               "detail": b.get("detail")}], token=token)
+                return self._json({"ok": True})
+            return self._json({"error": "not found"}, 404)
+        except supa.AuthError as e:
+            return self._json({"error": str(e)}, e.status)
+        except (KeyError, ValueError) as e:
+            return self._json({"error": f"bad request: {e}"}, 400)
+        except Exception as e:
+            return self._json({"error": str(e)}, 500)
 
     def log_message(self, *a):
         pass
@@ -210,5 +338,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     ENGINE = Engine()
     port = int(os.getenv("PORT", "8000"))
+    if not supa.enabled():
+        print("WARNING: SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY not set -> DEMO MODE, no login, "
+              "every screen is open. Set them in .env to turn on authentication.")
     print(f"Replaying test day {ENGINE.day}. Open http://localhost:{port}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

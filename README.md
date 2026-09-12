@@ -22,6 +22,51 @@ trains on screen move as the clock moves. `REPLAY_DATE=2026-08-29 python app/ser
 picks another day; `/api/trains?t=18:30` picks a time. `/api/cascade?train=14662&station=JP&delay=30`
 returns the trains pushed back by that delay.
 
+## Login, roles and own database (Supabase)
+
+| Role | Screens | Can do |
+|---|---|---|
+| guest / passenger | Passenger | view ETAs |
+| station | Station Display, Passenger | log board events |
+| controller | Control Room, Station Display, Passenger, Analytics | overrides, cascade, audit log |
+| admin | everything | + change roles |
+
+Security is enforced in three layers: the UI hides screens a role may not open; the server
+(`app/server.py`) checks the Supabase token and role on every privileged request; and
+row-level security in the database (`supabase/schema.sql`) refuses writes/reads even if
+someone calls Supabase directly. Nobody can promote themselves: sign-ups are always
+`passenger`, and staff accounts are created with a script.
+
+Setup (about 10 minutes):
+1. Create a project at supabase.com. In **SQL Editor**, paste and run `supabase/schema.sql`.
+2. **Project Settings > API**: copy the URL, the publishable (anon) key and the secret
+   (service_role) key into `.env` (see `.env.example`). The secret key stays on the server.
+3. **Authentication > Providers > Email**: enabled. For a demo you can turn off
+   "Confirm email" so passenger sign-ups work instantly.
+4. Create staff accounts:
+   ```
+   python -m pipeline.create_user controller@nwr.in "StrongPass#1" controller --employee NWR-8841
+   python -m pipeline.create_user jp.board@nwr.in "StrongPass#2" station --station JP
+   ```
+5. Copy stations, movements and predictions into the database: `python -m pipeline.sync_supabase`
+   (or one table at a time: `python -m pipeline.sync_supabase --only movements`)
+6. `python app/server.py` - the login screens now ask for email + password.
+
+Tables: `profiles` (role), `stations`, `eta_predictions`, `train_movements` (every recorded
+departure of the 40 trains - the movement history), `live_positions` (RailRadar snapshots),
+`overrides` (controller incidents, applied to everyone's ETAs for 6 h), `audit_log`
+(append-only). Movement tables are readable by staff only; both are written server-side with
+the secret key.
+New API: `GET /api/config`, `GET /api/me`, `POST /api/override`, `GET /api/audit`,
+`POST /api/log`; `/api/cascade` now needs a controller.
+
+Without Supabase keys the server runs in **demo mode** (no login, all screens open) and
+prints a warning - useful as an offline backup for the presentation.
+
+Tests: `python tests/test_auth.py` runs the real server against a fake Supabase with the same
+rules (18 checks: passengers/stations blocked from control endpoints, controllers allowed,
+overrides visible to passengers without staff identity).
+
 ## Weather (Open-Meteo) and track paths (OpenStreetMap)
 
 Both need internet once; results are cached in `data/cache/`.
@@ -58,7 +103,11 @@ models/kalman_2d.py       2D Kalman on 816 sections, 30-min congestion forecast
 models/gcn_lstm.py        GCN-LSTM (PyTorch) on the station graph
 models/fusion.py          inverse-MAE weights, sum = 1, per-row re-normalised
 models/cascade.py         headway push: who is delayed if train X is late
-app/server.py             API for the UI
+app/server.py             API for the UI + auth / roles
+supabase/schema.sql       tables, roles, row-level security
+pipeline/create_user.py   create staff accounts with a role
+pipeline/sync_supabase.py copy stations + movements + predictions into Supabase
+pipeline/collect_live.py  poll RailRadar live map into Supabase + a local CSV
 sources/                  RailKit, RailRadar, OpenStreetMap, Open-Meteo clients (live mode)
 tests/                    offline tests
 ```
@@ -94,7 +143,7 @@ Fused 80% range contains the true arrival 79.5% of the time.
 Network and weather features are offered too; they are kept only if validation improves
 (network did not; weather is offered once `pipeline.add_weather` has run).
 
-## Honest findings
+## Honest findings (tell the judges before they ask)
 
 - **XGBoost v2 covers all 40 trains.** The first model (kept in `XGBOOST/` and
   `models/xgb_branch_v1_teammate.py` for reference) only knew 27.
