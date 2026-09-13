@@ -1,18 +1,6 @@
-"""
-Poll RailRadar's live map and store the positions of your trains.
-
-Each poll is ONE RailRadar request (free sandbox = 1,000 a month, so every 5 minutes for
-8 hours = 96 calls). Rows go to:
-  * public.live_positions in Supabase, if the keys are in .env (your own database)
-  * data/live_positions.csv always, as an offline backup
-
-Run:  python -m pipeline.collect_live --interval 5 --hours 8
-      python -m pipeline.collect_live --interval 5 --hours 8 --all-trains
-"""
-import argparse
+﻿import argparse
 import time
 from datetime import datetime, timezone
-
 import pandas as pd
 
 from config import CLEAN_CSV, DATA
@@ -29,11 +17,18 @@ def our_trains():
 def to_rows(pts, ts):
     rows = []
     for p in pts.itertuples():
-        rows.append({"captured_at": ts, "train_no": int(p.train_no), "train_name": getattr(p, "train_name", None),
-                     "latitude": float(p.lat), "longitude": float(p.lon),
-                     "station_code": getattr(p, "station_code", None),
-                     "next_station": getattr(p, "next_station_code", None),
-                     "delay_min": None, "speed_kmh": None, "source": "railradar"})
+        rows.append({
+            "captured_at": ts,
+            "train_no": int(p.train_no),
+            "train_name": getattr(p, "train_name", None),
+            "latitude": float(p.lat),
+            "longitude": float(p.lon),
+            "station_code": getattr(p, "station_code", None),
+            "next_station": getattr(p, "next_station_code", None),
+            "delay_min": None,
+            "speed_kmh": None,
+            "source": "railradar"
+        })
     return rows
 
 
@@ -49,24 +44,32 @@ def main():
     to_db = supa.enabled() and supa.SECRET
     print(f"storing to {'Supabase + ' if to_db else ''}{CSV.name}; "
           f"RailRadar calls used this month: {used('railradar')}")
+
     end = time.time() + a.hours * 3600
     while time.time() < end:
         if used("railradar") >= a.budget:
             print("monthly budget reached, stopping")
             break
+
         ts = datetime.now(timezone.utc).isoformat()
         try:
             pts = railradar.snapshot_points(railradar.live_map())
             if keep is not None and len(pts):
                 pts = pts[pts.train_no.astype(int).isin(keep)]
             rows = to_rows(pts, ts) if len(pts) else []
+
             if rows:
                 pd.DataFrame(rows).to_csv(CSV, mode="a", header=not CSV.exists(), index=False)
                 if to_db:
-                    supa.insert("live_positions", rows)
+                    try:
+                        supa.insert("live_positions", rows)
+                    except Exception as db_err:
+                        print(f"[{ts}] Supabase remote sync skipped (local CSV updated): {db_err}")
+
             print(f"{ts}: {len(rows)} trains stored (calls this month: {used('railradar')})")
         except Exception as e:
             print(f"{ts}: poll failed: {e}")
+
         time.sleep(a.interval * 60)
 
 

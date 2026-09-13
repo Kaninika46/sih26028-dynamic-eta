@@ -74,11 +74,13 @@ class Engine:
         self.xgb_model = xgb_branch.load_model()
         self.known = set(xgb_branch.known_trains())
 
-    def breakdown(self, row, f, cong):
+    def breakdown(self, row, f, cong, wkind=None):
         out = []
         if int(row.train_no) in self.known:
             r = self.xgb.reasons(self.xgb_model, pd.DataFrame([row])).iloc[0]
-            out += [[k, round(abs(float(v)), 1)] for k, v in r.items()]
+            for k, v in r.items():
+                label = f"Weather ({wkind.replace('_', ' ')})" if k == "Weather" and wkind else k
+                out.append([label, round(abs(float(v)), 1)])
         else:
             kf = f.get("kf_pred", np.nan)
             out.append(["Running delay carried", round(abs(float(row.current_delay_min)) * 0.1, 1)])
@@ -86,8 +88,11 @@ class Engine:
                 out.append(["Historical pattern", round(abs(float(kf)), 1)])
         if cong and cong > 0.5:
             out.append(["Section congestion", round(float(cong), 1)])
-        out = [b for b in out if b[1] >= 0.5]
-        return sorted(out, key=lambda b: -b[1])[:4]
+        # keep the weather row whenever the model uses weather, even when its effect is small,
+        # so the app can always say what the weather contributed
+        wx = [b for b in out if b[0].startswith("Weather")]
+        rest = sorted([b for b in out if not b[0].startswith("Weather") and b[1] >= 0.5], key=lambda b: -b[1])
+        return (rest[:3] + wx) if wx else rest[:4]
 
     def weather(self, code, t):
         if self.wx is None:
@@ -145,6 +150,9 @@ class Engine:
             cong = float(self.cong.get(key, 0)) if self.cong is not None else 0.0
             names = g.station_name.tolist()
             codes = g.station_code.tolist()
+            # real scheduled clock time at every stop, so the timeline shows the timetable
+            # plus the predicted delay instead of "now + a minute per stop"
+            sched_times = [ts.strftime("%H:%M") if pd.notna(ts) else None for ts in g.sched_dep_ts]
             wkind, temp, vis = self.weather(row.station_code, t)
             path, seg = self.track(codes, k)
             if k + 1 < len(g):
@@ -155,6 +163,7 @@ class Engine:
             out.append({
                 "id": str(tn), "name": str(row.train_name).title(),
                 "from": names[0], "to": names[-1], "stations": names, "stopIdx": k,
+                "schedTimes": sched_times,
                 "predMin": round(max(0.0, cur + float(f.fused_pred)), 1),
                 "confLo": round(max(0.0, cur + float(f.fused_low)), 1),
                 "confHi": round(max(0.0, cur + float(f.fused_high)), 1),
@@ -163,11 +172,15 @@ class Engine:
                                                                      + f.fused_pred))).strftime("%H:%M"),
                 "weather": wkind, "tempC": temp, "visibilityKm": vis,
                 "path": path, "segPath": seg, "progress": round(prog, 3),
-                "breakdown": self.scale(self.breakdown(row, f, cong), max(0.0, cur + float(f.fused_pred))),
+                "breakdown": self.scale(self.breakdown(row, f, cong, wkind),
+                                        max(0.0, cur + float(f.fused_pred))),
                 "override": None,
             })
         out.sort(key=lambda x: -x["predMin"])
         return out
+
+    def live_train_list(self):
+        return sorted(self.df.train_no.astype(int).unique())
 
     def cascade(self, train, station, delay):
         from models.cascade import plan_for_day, propagate
@@ -175,6 +188,7 @@ class Engine:
         return propagate(plan, int(train), station, float(delay)).to_dict(orient="records")
 
 
+LIVE = os.getenv("LIVE", "").lower() in ("1", "true", "yes")
 ENGINE = None
 
 # ------------------------------------------------------------------ access control
@@ -272,7 +286,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"auth": supa.enabled(), "supabaseUrl": supa.URL,
                                    "supabaseKey": supa.PUBLISHABLE, "perms": PERMS})
             if u.path == "/api/health":
-                return self._json({"ok": True, "replay_day": str(ENGINE.day), "auth": supa.enabled()})
+                return self._json({"ok": True, "replay_day": str(ENGINE.day), "auth": supa.enabled(),
+                                   "live": LIVE})
             if u.path == "/api/coords":
                 return self._json(ENGINE.coords)
             if u.path == "/api/me":
@@ -282,6 +297,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({**user, **PERMS[user["role"]]})
             if u.path == "/api/trains":
                 user, _ = self._user()
+                live = LIVE or q.get("live") == "1"
+                if live:
+                    try:
+                        from models.live_eta import live_cards
+                        cards = live_cards(ENGINE.live_train_list())
+                        if cards:
+                            return self._json(apply_overrides(cards, user["role"]))
+                        print("live feed returned no running trains - falling back to replay")
+                    except Exception as e:
+                        print(f"live mode failed ({e}) - falling back to replay")
                 return self._json(apply_overrides(ENGINE.trains(q.get("t")), user["role"]))
             if u.path == "/api/cascade":
                 self._require("cascade")
@@ -341,5 +366,6 @@ if __name__ == "__main__":
     if not supa.enabled():
         print("WARNING: SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY not set -> DEMO MODE, no login, "
               "every screen is open. Set them in .env to turn on authentication.")
-    print(f"Replaying test day {ENGINE.day}. Open http://localhost:{port}")
+    print(("LIVE mode: RailRadar feed through the trained models."
+           if LIVE else f"Replaying test day {ENGINE.day}.") + f" Open http://localhost:{port}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
